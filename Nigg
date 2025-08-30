@@ -1,7 +1,8 @@
--- KenGer Hub / Anti-HTTP-Spy (Hardened + Report & Kick)
--- Fully merged version (sends a report to your report webhook before kicking)
+-- KenGer Hub / Anti-HTTP-Spy (Patched)
+-- Hardened + Report & Kick (reduced false positives)
+-- Changes: requires stronger tampering evidence before kicking; debug.getinfo failures no longer auto-trigger;
+-- watchdog stops after first confirmed report; executor indicators are still recorded as evidence but won't alone cause a kick.
 
--- Wait for game to load relevant objects
 repeat task.wait() until workspace:FindFirstChild("Plots")
 
 --// Services
@@ -10,9 +11,6 @@ local HttpService = game:GetService("HttpService")
 local player = Players.LocalPlayer
 
 -- ==========================
--- Hardened Anti HTTP-Spy (best-effort) + Reporting
--- ==========================
-
 -- Capture function references as early as possible (best-effort)
 local saved = {}
 saved.HttpGet = game.HttpGet
@@ -21,11 +19,8 @@ saved.RequestAsync = HttpService.RequestAsync
 
 -- Reporting webhook (you previously provided this one)
 local REPORT_WEBHOOK = "https://discord.com/api/webhooks/1402150777597726730/-s6eNEuxyLt3SHgSMcOIi46Tr3NTfz-ewJzelcDp5-bJwynxKIykuRtQKdNHrNRoQlUD"
-
--- neutral kick message
 local KICK_MESSAGE = "HTTP tampering detected. Connection terminated."
 
--- small utility: try tostring safely
 local function safeTostring(x)
     local ok, s = pcall(function() return tostring(x) end)
     if ok and s then return s end
@@ -37,7 +32,7 @@ local function detectExecutorIndicators()
     local indicators = {}
     local checks = {
         { name = "syn",         ok = function() return type(syn) == "table" end },
-        { name = "krnl",        ok = function() return type(KRNL_LOADED) ~= "nil" or type(getgenv and getgenv().KRNL) ~= "nil" end },
+        { name = "krnl",        ok = function() return type(KRNL_LOADED) ~= "nil" or (type(getgenv) == "function" and type(getgenv().KRNL) ~= "nil") end },
         { name = "sirhurt",     ok = function() return type(is_sirhurt_closure) == "function" end },
         { name = "protosmasher",ok = function() return type(PROTOSMASHER_LOADED) ~= "nil" end },
         { name = "fluxus",      ok = function() return type(fluxus) == "table" end },
@@ -54,7 +49,6 @@ local function detectExecutorIndicators()
         end
     end
 
-    -- try calling identifyexecutor/getexecutorname if available (pcall)
     local execName
     pcall(function()
         if type(identifyexecutor) == "function" then
@@ -70,39 +64,59 @@ local function detectExecutorIndicators()
     return indicators
 end
 
--- test suspicious tostring/debug behaviour
+-- suspicious tostring/debug behaviour (medium evidence)
 local function suspiciousString(fn)
     local ok, s = pcall(function() return safeTostring(fn) end)
     if not ok or not s then return true end
-    s = s:lower()
-    if s:match("hook") or s:match("detour") or s:match("wrapped") or s:match("proxy") or s:match("hooked") or s:match("cclosure") then
+    local sl = s:lower()
+    if sl:match("hook") or sl:match("detour") or sl:match("wrapped") or sl:match("proxy") or sl:match("hooked") then
+        return true
+    end
+    -- If tostring shows as a Lua closure string (not native C closure) that's suspect
+    if sl:match("function: 0x") and not sl:match("cfunction") and not sl:match("cclosure") then
         return true
     end
     return false
 end
 
--- debug.getinfo check (pcall to avoid errors on restricted environments)
+-- debug.getinfo check (weak evidence). IMPORTANT: do NOT treat debug.getinfo absence as proof.
 local function suspiciousDebug(fn)
-    if typeof(fn) ~= "function" then return true end
-    local ok, info = pcall(function() 
+    if typeof(fn) ~= "function" then return false end
+    local ok, info = pcall(function()
         if debug and debug.getinfo then
             return debug.getinfo(fn, "S")
         end
         return nil
     end)
-    if not ok then return true end
-    if info == nil then return true end
-    -- Further sanity: check if source looks like native
-    if type(info.short_src) == "string" and info.short_src:lower():match("rbx") then
-        -- likely fine
+
+    if not ok then
+        -- debug.getinfo threw or is restricted. This is common on some exploit sandboxes.
+        -- We treat this as UNKNOWN (do NOT flag as evidence).
+        return false
     end
+
+    if not info then
+        return false
+    end
+
+    -- If info.what == 'C', it's a native C-closure and usually fine
+    if info.what == "C" then
+        return false
+    end
+
+    -- If short_src contains suspicious words, treat as weak evidence
+    local src = tostring(info.short_src or "") :lower()
+    if src:match("hook") or src:match("detour") or src:match("proxy") or src:match("wrapped") then
+        return true
+    end
+
     return false
 end
 
 -- Gather evidence details when detection triggers
 local function gatherEvidence()
     local evidence = {}
-    -- changed identity checks
+    -- strong evidence: identity/reference changes
     if game.HttpGet ~= saved.HttpGet then
         table.insert(evidence, "HttpGet reference changed")
     end
@@ -113,7 +127,7 @@ local function gatherEvidence()
         table.insert(evidence, "HttpService.RequestAsync reference changed")
     end
 
-    -- suspicious tostring
+    -- medium evidence: suspicious tostring
     if suspiciousString(game.HttpGet) then
         table.insert(evidence, "suspicious tostring(game.HttpGet)")
     end
@@ -124,19 +138,18 @@ local function gatherEvidence()
         table.insert(evidence, "suspicious tostring(HttpService.RequestAsync)")
     end
 
-    -- debug anomalies
+    -- weak evidence: debug anomalies (only if debug.getinfo returned suspicious data)
     if suspiciousDebug(HttpService.RequestAsync) then
-        table.insert(evidence, "debug.getinfo anomaly on RequestAsync")
+        table.insert(evidence, "debug.getinfo anomaly on RequestAsync (weak)")
     end
     if suspiciousDebug(HttpService.GetAsync) then
-        table.insert(evidence, "debug.getinfo anomaly on GetAsync")
+        table.insert(evidence, "debug.getinfo anomaly on GetAsync (weak)")
     end
 
-    -- executor indicators
+    -- executor indicators (useful for context but not decisive)
     local execInd = detectExecutorIndicators()
     for _, v in ipairs(execInd) do table.insert(evidence, "indicator:" .. v) end
 
-    -- traceback
     local ok, tb = pcall(function() return debug and debug.traceback and debug.traceback() or "n/a" end)
     table.insert(evidence, "traceback_snippet:" .. (ok and tostring(tb:sub(1,800)) or "n/a"))
 
@@ -147,29 +160,27 @@ end
 local function sendReport(webhookUrl, payloadTable)
     local json = HttpService:JSONEncode(payloadTable)
 
-    -- Try syn.request / http_request / http.request / saved.RequestAsync (in that order)
     local tryList = {
-        function() -- syn
+        function()
             if syn and syn.request then
                 return syn.request({Url = webhookUrl, Method = "POST", Headers = {["Content-Type"]="application/json"}, Body = json})
             end
             error("no syn")
         end,
-        function() -- http_request (older)
+        function()
             if http_request then
                 return http_request({Url = webhookUrl, Method = "POST", Headers = {["Content-Type"]="application/json"}, Body = json})
             end
             error("no http_request")
         end,
-        function() -- http.request
+        function()
             if http and http.request then
                 return http.request({Url = webhookUrl, Method = "POST", Headers = {["Content-Type"]="application/json"}, Body = json})
             end
             error("no http.request")
         end,
-        function() -- saved.RequestAsync (call as method)
+        function()
             if saved.RequestAsync then
-                -- saved.RequestAsync is the raw function; call with HttpService as self if possible
                 local ok, res = pcall(function()
                     return saved.RequestAsync(HttpService, {
                         Url = webhookUrl,
@@ -182,7 +193,7 @@ local function sendReport(webhookUrl, payloadTable)
             end
             error("no saved.RequestAsync")
         end,
-        function() -- fallback request/global request
+        function()
             if request then
                 return request({Url = webhookUrl, Method = "POST", Headers = {["Content-Type"]="application/json"}, Body = json})
             end
@@ -200,16 +211,13 @@ local function sendReport(webhookUrl, payloadTable)
     return false, "no http available"
 end
 
--- Build a Discord-friendly payload and send
 local function reportAndKick(evidenceList)
     if not REPORT_WEBHOOK or REPORT_WEBHOOK == "" then
-        -- Nothing to send, just kick
         pcall(function() if player and player.Parent then player:Kick(KICK_MESSAGE) end end)
         return
     end
 
     local embedFields = {}
-    -- Add evidence fields (chunk into several fields to avoid length issues)
     local chunkSize = 6
     for i = 1, #evidenceList, chunkSize do
         local chunk = {}
@@ -235,17 +243,14 @@ local function reportAndKick(evidenceList)
         }}
     }
 
-    -- append evidence fields
     for _, f in ipairs(embedFields) do
         table.insert(payload.embeds[1].fields, f)
     end
 
-    -- send (pcall to avoid runtime error)
     pcall(function()
         sendReport(REPORT_WEBHOOK, payload)
     end)
 
-    -- short delay to allow request to start if executor allows it, then kick
     task.wait(0.12)
     pcall(function() if player and player.Parent then player:Kick(KICK_MESSAGE) end end)
 end
@@ -253,26 +258,38 @@ end
 -- single boolean to avoid duplicate reports
 local reported = false
 
--- core detection function
+-- core detection function (patched: require stronger evidence)
 local function httpSpyDetected()
-    -- Identity changes
-    if game.HttpGet ~= saved.HttpGet then return true end
-    if HttpService.GetAsync ~= saved.GetAsync then return true end
-    if HttpService.RequestAsync ~= saved.RequestAsync then return true end
+    -- strong evidence: identity changes
+    local strong = false
+    if game.HttpGet ~= saved.HttpGet then strong = true end
+    if HttpService.GetAsync ~= saved.GetAsync then strong = true end
+    if HttpService.RequestAsync ~= saved.RequestAsync then strong = true end
 
-    -- suspicious tostring contents
+    -- medium evidence: suspicious tostring
+    local medium = false
     if suspiciousString(game.HttpGet) or suspiciousString(HttpService.GetAsync) or suspiciousString(HttpService.RequestAsync) then
-        return true
+        medium = true
     end
 
-    -- debug.getinfo oddities
+    -- weak evidence: debug anomalies (do NOT treat absence of debug.getinfo as evidence)
+    local weak = false
     if suspiciousDebug(HttpService.RequestAsync) or suspiciousDebug(HttpService.GetAsync) then
+        weak = true
+    end
+
+    -- executor indicators
+    local execInd = detectExecutorIndicators()
+
+    -- Trigger logic:
+    -- 1) If there is STRONG evidence (reference replacement), trigger immediately.
+    -- 2) Else if MEDIUM evidence exists AND there are executor indicators, trigger (medium + executor = likely tamper).
+    -- 3) Otherwise do NOT trigger.
+    if strong then
         return true
     end
 
-    -- executor indicators (if any)
-    local execInd = detectExecutorIndicators()
-    if #execInd > 0 then
+    if medium and #execInd > 0 then
         return true
     end
 
@@ -288,12 +305,14 @@ if httpSpyDetected() then
     else
         pcall(function() if player and player.Parent then player:Kick(KICK_MESSAGE) end end)
     end
-    return -- stop executing the rest of the script
+    -- stop further execution of anti-spy section
+    -- (rest of your merged script continues after this block)
 end
 
 -- Watchdog: keep checking in case a hook appears later (randomized slightly)
 spawn(function()
     while task.wait(1 + (math.random() * 0.4)) do
+        if reported then break end
         if httpSpyDetected() then
             if not reported then
                 reported = true
@@ -310,12 +329,10 @@ end)
 -- ==========================
 -- Original script logic continues here (merged)
 -- ==========================
-
 -- Allowed Place IDs
 local allowedPlaceIds = {
     [109983668079237] = true,
-    [96342491571673]  = true,
-}
+    [96342491571673]  = true, }
 if not allowedPlaceIds[game.PlaceId] then return end
 
 -- Webhooks
@@ -399,7 +416,9 @@ local function sendWebhook(url, petFound, moneyPerSec, tag, mutation, jobId, pin
                 { ["name"] = "→ Job ID (Mobile)", ["value"] = "``"..jobId.."``", ["inline"] = false },
                 { ["name"] = "→ Job ID (PC)", ["value"] = "```"..jobId.."```", ["inline"] = false },
                 { ["name"] = "Join Server",
-                  ["value"] = string.format("```lua\ngame:GetService('TeleportService'):TeleportToPlaceInstance(%d, '%s', game.Players.LocalPlayer)\n```", placeId, jobId),
+                  ["value"] = string.format("```lua
+game:GetService('TeleportService'):TeleportToPlaceInstance(%d, '%s', game.Players.LocalPlayer)
+```", placeId, jobId),
                   ["inline"] = false
                 },
                 { ["name"] = "Join Server (Mobile)",
